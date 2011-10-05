@@ -1,0 +1,14 @@
+compile.cmi: cparse.cmo 
+ctab.cmi: cparse.cmo 
+clex.cmo: error.cmo ctab.cmi cparse.cmo 
+clex.cmx: error.cmx ctab.cmx cparse.cmx 
+compile.cmo: genlab.cmo error.cmo cparse.cmo compile.cmi 
+compile.cmx: genlab.cmx error.cmx cparse.cmx compile.cmi 
+cparse.cmo: error.cmo 
+cparse.cmx: error.cmx 
+ctab.cmo: error.cmo cparse.cmo ctab.cmi 
+ctab.cmx: error.cmx cparse.cmx ctab.cmi 
+main.cmo: verbose.cmo error.cmo ctab.cmi cparse.cmo compile.cmi clex.cmo 
+main.cmx: verbose.cmx error.cmx ctab.cmx cparse.cmx compile.cmx clex.cmx 
+top.cmo: error.cmo ctab.cmi cparse.cmo compile.cmi clex.cmo 
+top.cmx: error.cmx ctab.cmx cparse.cmx compile.cmx clex.cmx 
