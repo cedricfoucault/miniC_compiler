@@ -4,6 +4,9 @@ open Printf
 
 let str_decl = ref ([] : (string * string) list)
 (* couples (s, label) where s is a string constant that has been stored at the address specified by label *)
+   (****************************************************************************)
+(*               x86 ASSEMBLY TYPES AND INSTRUCTIONS ALIASES                *)
+(****************************************************************************)
 
 type register = EAX | EBX | ECX | EDX | EBP | ESP
 
@@ -18,7 +21,7 @@ let str_of_reg = function
 type obj = 
 | Reg of register  (* register *)
 | Const of int (* constant (in C-- all values are integers) *)
-| Global of string (* global variable *)
+| Global of string (* global variable or code location *)
 | Local of int  (* local variable (pushed on the call stack) *)
 | Elem of register * register (* Elem (r1, r2) represents 1 element of an array where the r1 points to the first element of the array r2 contains the index i of the element *)
 
@@ -91,6 +94,10 @@ let idiv_ out dest =
   Printf.fprintf out "    idivl   %s\n" s
 let leave_ out () = Printf.fprintf out "    leave\n"
 let ret_ out () = Printf.fprintf out "    ret\n"
+
+(****************************************************************************)
+(*                        COMPILATION OF EXPRESSIONS                        *)
+(****************************************************************************)
 
 let rec compile_expr out func env e = 
 (* type :: out_channel -> string -> (string * int) list -> Cparse.var_declaration list -> unit *)
@@ -179,6 +186,16 @@ let rec compile_expr out func env e =
           mov var eax;
           inc var;
         end
+      | OP2 (S_INDEX, e1, e2) ->
+        begin
+          compile_expr out func env e1;
+          push eax;
+          compile_expr out func env e2;
+          mov eax ecx;
+          pop ebx;
+          mov (Elem(EBX, ECX)) eax;
+          inc (Elem(EBX, ECX));
+        end
       | _ -> failwith "Incompatible expression with \"++\" operator"
       end
     | M_POST_DEC ->
@@ -189,6 +206,16 @@ let rec compile_expr out func env e =
           in
           mov var eax;
           dec var;
+        end
+      | OP2 (S_INDEX, e1, e2) ->
+        begin
+          compile_expr out func env e1;
+          push eax;
+          compile_expr out func env e2;
+          mov eax ecx;
+          pop ebx;
+          mov (Elem(EBX, ECX)) eax;
+          dec (Elem(EBX, ECX));    
         end
       | _ -> failwith "Incompatible expression with \"--\" operator"
       end
@@ -201,6 +228,16 @@ let rec compile_expr out func env e =
           inc var;
           mov var eax;
         end
+      | OP2 (S_INDEX, e1, e2) ->
+        begin
+          compile_expr out func env e1;
+          push eax;
+          compile_expr out func env e2;
+          mov eax ecx;
+          pop ebx;
+          inc (Elem(EBX, ECX));
+          mov (Elem(EBX, ECX)) eax;
+        end        
       | _ -> failwith "Incompatible expression with \"++\" operator";
       end
     | M_PRE_DEC ->
@@ -211,6 +248,16 @@ let rec compile_expr out func env e =
           in
           dec var;
           mov var eax;
+        end
+      | OP2 (S_INDEX, e1, e2) ->
+        begin
+          compile_expr out func env e1;
+          push eax;
+          compile_expr out func env e2;
+          mov eax ecx;
+          pop ebx;
+          dec (Elem(EBX, ECX));
+          mov (Elem(EBX, ECX)) eax;
         end
       | _ -> failwith "Incompatible expression with \"--\" operator";
       end
@@ -313,14 +360,15 @@ let rec compile_expr out func env e =
   | ESEQ l_exp -> List.iter (compile_expr out func env) l_exp;
   end
 
+  (****************************************************************************)(*                         COMPILATION OF STATEMENTS                        *)  (****************************************************************************)
+
 let rec compile_code out func env code =
 (* type :: out_channel -> string -> (string * int) list ->   Cparse.var_declaration list -> unit *)
   let add = add_ out and sub = sub_ out and cmp = cmp_ out and jmp = jmp_ out         and jne = jne_ out and print = Printf.fprintf out "%s:\n" in
     
   begin match (snd code) with
   | CBLOCK (vars, blockcode) ->
-    (* CBLOCK ~ { vars : variable declarations;
-                 blockcode : sequence of instructions } *)
+    (* { vars: variable declarations; blockcode: sequence of instructions } *)
     begin
       (* allocate enough memory for all new local variables *)
       let nvar = List.length vars in
@@ -378,6 +426,7 @@ let rec compile_code out func env code =
       print "# exit loop"
     end
   | CRETURN op ->
+    (* return exp; *)
     begin
       begin match op with
       | Some exp -> compile_expr out func env exp
@@ -386,7 +435,135 @@ let rec compile_code out func env code =
       let epilogue = func ^ "_epilogue" in
       jmp (Global(epilogue)); (* label where the function epilogue is put *)
     end
+  | CTHROW (exc, exp) ->
+    (* throw exc (exp)*)
+    begin
+      throw exc exp;
+    end
+  | CTRY (c, l, cf) ->
+    (* try c; catch (Exc1 x1) c1;... catch (Excn xn) cn; finally cf;
+    where l = [("Exc1", "x1", c1);...] *)
+    begin
+      let llab = List.map genlab l and final_lab = genlab func in
+      let lcatch = List.combine l llab in
+      let end_lab = genlab func in
+      begin_try (List.head llab);
+      compile_code out func env c;
+      end_try final_lab;
+      let compile_catch final_lab = function
+      | [] -> ()
+      | [(catch_lab, (exc, var, code))] ->
+          catch catch_lab final_lab final_lab exc var code
+      | (catch_lab, (exc, var, code)) :: ((next_lab, _) :: _) as t ->
+          catch catch_lab next_lab final_lab exc var code
+      in
+      compile_catch final_lab lcatch;
+      printn final_lab;
+      begin match cf with
+      | Some code -> finally end_lab code;
+      | _ -> ()
+      end
+    end
   end
+  
+  type 'a stack = 'a list (* some implementation of a stack *)
+  type stack_frame = {ebp: obj; esp: obj}
+  type eh_registration = {save_context: stack_frame; handler_spot: obj} (* exception handling registration, stores infos... *)
+
+  let create_ehandler name =
+    begin
+      print ".globl _eh"
+      printn "_eh" 
+      print ".zero 4"
+    end
+
+  let create_registration first_catch_label =
+    begin
+      push 16;
+      call malloc;
+      mov ebp, (eax);
+      mov esp, 4(eax);
+      mov first_catch_label, 8(eax);
+    end
+
+  let free_registration () =
+    begin
+      push eax;
+      call free;
+    end
+
+  let push_registration () =
+     begin
+       mov handler_name, 12(eax);
+       mov eax, handler_name;
+     end
+
+  let pop_registration () =
+     begin
+       mov handler_name, eax;
+       mov 12(eax), handler_name;
+     end
+
+  let throw exc_name exp =
+    begin
+      (* value of the exception in ebx *)
+      compile_expr ...exp; 
+      mov eax, ebx;
+      (* name of the exception in ecx *)
+      compile_expr ...STRING(exc_name);
+      mov eax, ecx;
+      (* pop exception handler, restore frame, jmp to catch label *)
+      pop_registration ();
+      mov (eax), ebp;
+      mov 4(eax), esp;
+      mov 8(eax), edx;
+      free_registration ();
+      jmp edx;
+    end
+
+  let begin_try first_catch_label =
+    begin
+      create_registration first_catch_label;
+      push_registration ();  
+    end
+
+  let end_try final_label =
+    begin
+      pop_registration ();
+      free_registration ();
+      jmp final_label;
+    end
+
+  let catch catch_label next_label finally_label exc_name var_name code =
+    begin
+      print catch_label;
+      push ecx;
+      push exc_name;
+      call strcmp;
+      add 8 esp;
+      cmp O eax;
+      jnz next_label;
+      declare_and_allocate var_name;
+      mov ebx var_name;
+      compile_code code;
+      mov 0 ecx; (* delete exception *)
+      jmp finally_label;
+    end
+
+  let finally end_label code =
+    begin
+      push ecx;
+      push ebx;
+      compile_code out func env code;
+      pop ebx;
+      pop ecx;
+      cmp 0 ecx; (* if there is still an exception *)
+      jz end_label;
+      throw ecx ebx;
+      printn end_label;
+    end
+    
+(****************************************************************************)(*                   COMPILATION OF GLOBAL DECLARATIONS                     *)  (****************************************************************************)
 
 let compile out decl_list =
 (* type :: out_channel -> Cparse.var_declaration list -> unit *)
