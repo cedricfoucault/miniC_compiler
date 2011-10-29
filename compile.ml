@@ -43,9 +43,9 @@ let str_of_obj = function
 let mov_ out source dest =
   let s1 = str_of_obj source and s2 = str_of_obj dest in
   Printf.fprintf out "    movl    %s, %s\n" s1 s2
-let leal_ out source dest =
+let lea_ out source dest =
   let s1 = str_of_obj source and s2 = str_of_obj dest in
-  Printf.fprintf out "    leal    %s, %s\n" s1 s2
+  Printf.fprintf out "    lea    %s, %s\n" s1 s2
 let add_ out source dest =
   let s1 = str_of_obj source and s2 = str_of_obj dest in
   Printf.fprintf out "    addl    %s, %s\n" s1 s2
@@ -104,7 +104,7 @@ let ret_ out () = Printf.fprintf out "    ret\n"
 
 let rec compile_expr out func env e = 
 (* type :: out_channel -> string -> (string * int) list -> Cparse.var_declaration list -> unit *)
-  let mov = mov_ out and leal = leal_ out and add = add_ out and sub = sub_ out and imul = imul_ out and cmp = cmp_ out and jmp = jmp_ out and je = je_ out and jne = jne_ out and jle = jle_ out and jl = jl_ out and cltd = cltd_ out and idiv = idiv_ out and push = push_ out and pop = pop_ out and neg = neg_ out  and inc = inc_ out and dec = dec_ out and call = call_ out and print = Printf.fprintf out "%s:\n" in
+  let mov = mov_ out and lea = lea_ out and add = add_ out and sub = sub_ out and imul = imul_ out and cmp = cmp_ out and jmp = jmp_ out and je = je_ out and jne = jne_ out and jle = jle_ out and jl = jl_ out and cltd = cltd_ out and idiv = idiv_ out and push = push_ out and pop = pop_ out and neg = neg_ out  and inc = inc_ out and dec = dec_ out and call = call_ out and print = Printf.fprintf out "%s:\n" in
   
   begin match (snd e) with
   | CST x ->
@@ -115,7 +115,7 @@ let rec compile_expr out func env e =
     begin  
       let s_label = genlab func in
       str_decl := (s, s_label) :: !str_decl;
-      leal (Global(s_label)) eax;
+      lea (Global(s_label)) eax;
     end
   | VAR s ->
     (* variable x, where s == "x" *)
@@ -367,9 +367,8 @@ let rec compile_expr out func env e =
 
 let rec compile_code out func env code =
 (* type :: out_channel -> string -> (string * int) list ->   Cparse.var_declaration list -> unit *)
-  let add = add_ out and sub = sub_ out and cmp = cmp_ out and jmp = jmp_ out         and je = je_ out and jne = jne_ out and push = push_ out and pop = pop_ out and mov = mov_ out and call = call_ out and print = Printf.fprintf out "%s:\n" in
-  
-  let handler_name = "_eh" and error_label = "error" in
+  let add = add_ out and sub = sub_ out and cmp = cmp_ out and jmp = jmp_ out         and je = je_ out and jne = jne_ out and push = push_ out and pop = pop_ out and mov = mov_ out and call = call_ out and print = Printf.fprintf out "%s:\n"  and lea = lea_ out in
+  let handler_name = "_eh" and error_label = "_error_uncaught_exception" in
   
   let jmp_at addr =
     let s = str_of_obj addr in
@@ -380,9 +379,11 @@ let rec compile_code out func env code =
     begin
       push (Const(16));
       call (Global("malloc"));
+      add (Const(4)) esp;
       mov ebp (Indirect(0, EAX));
       mov esp (Indirect(4, EAX));
-      mov (Global(first_catch_label)) (Indirect(8, EAX));
+      lea (Global(first_catch_label)) edx;
+      mov edx (Indirect(8, EAX));
     end
   in
 
@@ -390,21 +391,28 @@ let rec compile_code out func env code =
     begin
       push eax;
       call (Global("free"));
+      add (Const(4)) esp;
     end
   in
 
   let push_registration () =
-     begin
-       mov (Global(handler_name)) (Indirect(12, EAX));
-       mov eax (Global(handler_name));
-     end
+    begin
+     mov (Global(handler_name)) edx;
+     mov edx (Indirect(12, EAX));
+     mov eax (Global(handler_name));
+    end
   in
 
   let pop_registration () =
-     begin
-       mov (Global(handler_name)) eax;
-       mov (Indirect(12, EAX)) (Global(handler_name));
-     end
+    begin
+     mov (Global(handler_name)) eax;
+     (* If the exception handler stack is empty, quit program with an error *)
+     cmp (Const(0)) eax;
+     je (Global(error_label));
+     (* If the stack is not empty, put the next element as top of the stack *)
+     mov (Indirect(12, EAX)) edx;
+     mov edx (Global(handler_name));
+    end
   in
   
   let throw_again () =
@@ -413,17 +421,19 @@ let rec compile_code out func env code =
     begin
       (* Pop the exception handler *)
       pop_registration ();
-      (* If there was no more exception handler, quit program with an error *)
-      cmp (Const(0)) eax;
-      je (Global(error_label));
       (* If an exception handler was found... *)
       (** restore the frame context of the try block **)
       mov (Indirect(0, EAX)) ebp;
       mov (Indirect(4, EAX)) esp;
-      mov (Indirect(8, EAX)) edx;
+      push ebx;
+      push ecx;
+      push (Indirect(8, EAX));
       (** free the handler from memory **)
       free_registration ();
       (** and jump to the first catch **)
+      pop edx;
+      pop ecx;
+      pop ebx;
       jmp_at edx;
     end
   in
@@ -453,7 +463,6 @@ let rec compile_code out func env code =
 
   let end_try final_label =
     begin
-      print "# end try";
       pop_registration ();
       free_registration ();
       jmp (Global(final_label));
@@ -488,7 +497,7 @@ let rec compile_code out func env code =
       let min_offset = find_min_offset env in
       let new_env = (var_name, min_offset - 4) :: env in
       sub (Const(4)) esp;
-      mov ebx (Global(var_name));
+      mov ebx (Local(List.assoc var_name new_env));
       (** compile the code of the catch **)
       compile_code out func new_env code;
       (** free the variable **)
@@ -618,7 +627,7 @@ let rec compile_code out func env code =
       | [] -> ()
       | [(catch_lab, (exc, var, code))] ->
           catch catch_lab final_lab final_lab exc var code (fst code)
-      | (catch_lab, (exc, var, code)) :: ((next_lab, _) :: _) as t ->
+      | (catch_lab, (exc, var, code)) :: (((next_lab, _) :: _) as t) ->
         begin
           catch catch_lab next_lab final_lab exc var code (fst code);
           compile_catch final_lab t;
@@ -648,21 +657,16 @@ let rec compile_code out func env code =
 
 let compile out decl_list =
 (* type :: out_channel -> Cparse.var_declaration list -> unit *)
-  let mov = mov_ out and push = push_ out and leave = leave_ out and ret = ret_ out and print = Printf.fprintf out "%s:\n" and printn = Printf.fprintf out "%s\n" in 
-  
-  let handler_name = "_eh" in
-  let create_ehandler name =
-    begin
-      print ".globl _eh";
-      printn ".bss";
-      printn name;
-      print ".zero 4";
-    end
-  in
+  let mov = mov_ out and push = push_ out and call = call_ out and add = add_ out and leave = leave_ out and ret = ret_ out and print = Printf.fprintf out "%s:\n" and printn = Printf.fprintf out "%s\n" in 
+  let handler_name = "_eh" and error_label = "_uncaught_exc" in
   
   begin
     (* Create the global variable for the stack of exception handlers *)
-    create_ehandler handler_name;
+    printn ".bss\n";
+    printn (".globl " ^ handler_name);
+    print handler_name;
+    printn "    .long   0";
+    printn "\n";
     
     (* Separate list into one list of global variable declarations (CDECL) *)
     (* and one list of function declaraction (CFUN) *)
@@ -681,6 +685,7 @@ let compile out decl_list =
       | _ -> get_fun t
     in
     let var_list = get_var decl_list and fun_list = get_fun decl_list in
+    
     (* compile global variable declarations *)
     if var_list = [] then () else begin
       printn "# global variables data segment";
@@ -694,6 +699,7 @@ let compile out decl_list =
       List.iter compile_var var_list;
       printn "";
     end;
+    
     (* compile functions *)
     if fun_list = [] then () else begin
       printn ".text";
@@ -728,6 +734,24 @@ let compile out decl_list =
       in
       List.iter compile_fun fun_list;
     end;
+    
+    (* create code to handle uncaught exception errors *)
+    (** analagous to the following C code : **)
+    (** fprintf(stderr, "error : uncaught exception '%s %d'", exc, value); **)
+    (** fflush(stderr); exit(-1); **)
+    let err_msg = "error : uncaught exception '%s %d'" in
+    print error_label;
+    compile_expr out "err" [] (("",0,0,0,0), STRING(err_msg));
+    push ebx;
+    push ecx;
+    push eax;
+    push (Global("stderr"));
+    call (Global("fprintf"));
+    call (Global("fflush"));
+    add (Const(12)) esp;
+    push (Const(-1));
+    call (Global("exit"));
+    
     (* compile string declarations *)
     if (!str_decl <> []) then print "\n# strings storage segment";
     let compile_str (str, label) = 
@@ -738,4 +762,5 @@ let compile out decl_list =
       end
     in
     List.iter compile_str !str_decl;
+    
   end
