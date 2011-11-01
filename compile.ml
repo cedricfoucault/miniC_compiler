@@ -45,7 +45,7 @@ let mov_ out source dest =
   Printf.fprintf out "    movl    %s, %s\n" s1 s2
 let lea_ out source dest =
   let s1 = str_of_obj source and s2 = str_of_obj dest in
-  Printf.fprintf out "    lea    %s, %s\n" s1 s2
+  Printf.fprintf out "    leal    %s, %s\n" s1 s2
 let add_ out source dest =
   let s1 = str_of_obj source and s2 = str_of_obj dest in
   Printf.fprintf out "    addl    %s, %s\n" s1 s2
@@ -365,10 +365,10 @@ let rec compile_expr out func env e =
 
   (****************************************************************************)(*                         COMPILATION OF STATEMENTS                        *)  (****************************************************************************)
 
-let rec compile_code out func env code =
+let rec compile_code out func env code finally_list =
 (* type :: out_channel -> string -> (string * int) list ->   Cparse.var_declaration list -> unit *)
   let add = add_ out and sub = sub_ out and cmp = cmp_ out and jmp = jmp_ out         and je = je_ out and jne = jne_ out and push = push_ out and pop = pop_ out and mov = mov_ out and call = call_ out and print = Printf.fprintf out "%s:\n"  and lea = lea_ out in
-  let handler_name = "_eh" and error_label = "_error_uncaught_exception" in
+  let handler_name = "_eh" and error_label = "_uncaught_exc" in
   
   let jmp_at addr =
     let s = str_of_obj addr in
@@ -590,6 +590,18 @@ let rec compile_code out func env code =
   | CRETURN op ->
     (* return exp; *)
     begin
+      (* execute finally clauses of the try blocks inside the *)
+      (* current function *)
+      let finish = function
+      | [] -> ()
+      | h :: t -> 
+        begin
+          compile_code out func env t h;
+          finish t;
+        end
+      in
+      finish finally_list;
+      (* then actually return from the function *)
       begin match op with
       | Some exp -> compile_expr out func env exp
       | _ -> ()
@@ -613,9 +625,10 @@ let rec compile_code out func env code =
       in let lcatch = make_lcatch l and final_lab = genlab func in
       
       (* enter a try block *)
+      let new_finally_list = cf :: finally_list in
       print "# begin try block";
       begin_try (fst (List.hd lcatch));
-      compile_code out func env c;
+      compile_code out func env c new_finally_list;
       
       (* return from the try block *)
       print "# end try block";
@@ -738,8 +751,8 @@ let compile out decl_list =
     (* create code to handle uncaught exception errors *)
     (** analagous to the following C code : **)
     (** fprintf(stderr, "error : uncaught exception '%s %d'", exc, value); **)
-    (** fflush(stderr); exit(-1); **)
-    let err_msg = "error : uncaught exception '%s %d'" in
+    (** fflush(stderr); abort(); **)
+    let err_msg = "error : uncaught exception '%s %d'\n" in
     print error_label;
     compile_expr out "err" [] (("",0,0,0,0), STRING(err_msg));
     push ebx;
@@ -749,8 +762,7 @@ let compile out decl_list =
     call (Global("fprintf"));
     call (Global("fflush"));
     add (Const(12)) esp;
-    push (Const(-1));
-    call (Global("exit"));
+    call (Global("abort"));
     
     (* compile string declarations *)
     if (!str_decl <> []) then print "\n# strings storage segment";
