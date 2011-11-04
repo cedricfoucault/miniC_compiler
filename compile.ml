@@ -365,7 +365,7 @@ let rec compile_expr out func env e =
 
   (****************************************************************************)(*                         COMPILATION OF STATEMENTS                        *)  (****************************************************************************)
 
-let rec compile_code out func env code finally_list =
+let rec compile_code out func env finally_list code =
 (* type :: out_channel -> string -> (string * int) list ->   Cparse.var_declaration list -> unit *)
   let add = add_ out and sub = sub_ out and cmp = cmp_ out and jmp = jmp_ out         and je = je_ out and jne = jne_ out and push = push_ out and pop = pop_ out and mov = mov_ out and call = call_ out and print = Printf.fprintf out "%s:\n"  and lea = lea_ out in
   let handler_name = "_eh" and error_label = "_uncaught_exc" in
@@ -465,6 +465,7 @@ let rec compile_code out func env code finally_list =
     begin
       pop_registration ();
       free_registration ();
+      mov (Const(0)) ecx;
       jmp (Global(final_label));
     end
   in
@@ -499,7 +500,7 @@ let rec compile_code out func env code finally_list =
       sub (Const(4)) esp;
       mov ebx (Local(List.assoc var_name new_env));
       (** compile the code of the catch **)
-      compile_code out func new_env code;
+      compile_code out func new_env finally_list code;
       (** free the variable **)
       add (Const(4)) esp;
       (** delete the exception **)
@@ -509,22 +510,15 @@ let rec compile_code out func env code finally_list =
     end
   in
 
-  let finally end_label code =
+  let finally code =
     begin
       (* compile the code of the finally *)
       (* being careful to save then restore the exception registers *)
       push ebx;
       push ecx;
-      compile_code out func env code;
+      compile_code out func env finally_list code;
       pop ecx;
       pop ebx;
-      (* if the exception has been caught, jump to the end *)
-      cmp (Const(0)) ecx;
-      je (Global(end_label));
-      (* if not, throw the exception again *)
-      throw_again ();
-      print "# end catch";
-      print end_label;
     end
   in
     
@@ -551,7 +545,7 @@ let rec compile_code out func env code finally_list =
       in
       let new_env = add_vars env min_offset vars in
       (* compile the instructions *)
-      List.iter (compile_code out func new_env) blockcode;
+      List.iter (compile_code out func new_env finally_list) blockcode;
       (* free the local variables from the stack *)
       if nvar <> 0 then add (Const(4 * nvar)) esp;
     end
@@ -564,11 +558,11 @@ let rec compile_code out func env code finally_list =
       let yes_label = genlab func and end_label = genlab func in
       jne (Global(yes_label));
       print "# no";
-      compile_code out func env c2;
+      compile_code out func env finally_list c2;
       jmp (Global(end_label));
       print "# yes";
       print yes_label;
-      compile_code out func env c1;
+      compile_code out func env finally_list c1;
       print "# exit if";
       print end_label;
     end
@@ -579,7 +573,7 @@ let rec compile_code out func env code finally_list =
       jmp (Global(condition_label));
       print "# loop iteration";
       print loop_label;
-      compile_code out func env code;
+      compile_code out func env finally_list code;
       print "# condition";
       print condition_label;
       compile_expr out func env expr;
@@ -592,11 +586,15 @@ let rec compile_code out func env code finally_list =
     begin
       (* execute finally clauses of the try blocks inside the *)
       (* current function *)
-      let finish = function
+      let rec finish = function
       | [] -> ()
       | h :: t -> 
         begin
-          compile_code out func env t h;
+          pop_registration ();
+          free_registration ();
+          match h with
+          | Some (code) -> compile_code out func env t code;
+          | _ -> ();
           finish t;
         end
       in
@@ -619,16 +617,20 @@ let rec compile_code out func env code finally_list =
     (* try c; catch (Exc1 x1) c1;... catch (Excn xn) cn; finally cf;
     where l = [("Exc1", "x1", c1);...] *)
     begin
+      (* initialise list of labels of each catch and finally clause *)
       let rec make_lcatch = function
       | [] -> []
       | h :: t -> (genlab func, h)  :: (make_lcatch t)
       in let lcatch = make_lcatch l and final_lab = genlab func in
       
       (* enter a try block *)
-      let new_finally_list = cf :: finally_list in
+      let new_finally_list = cf :: finally_list
+      and first_handler = 
+        if lcatch = [] then final_lab else fst (List.hd lcatch)
+      in
       print "# begin try block";
-      begin_try (fst (List.hd lcatch));
-      compile_code out func env c new_finally_list;
+      begin_try (first_handler);
+      compile_code out func env new_finally_list c;
       
       (* return from the try block *)
       print "# end try block";
@@ -649,20 +651,23 @@ let rec compile_code out func env code finally_list =
       compile_catch final_lab lcatch;
       
       (* compile finally *)
+      let end_lab = genlab func in
       begin match cf with
       | Some code -> 
         begin
-          let end_lab = genlab func in
           print "# finally";
           print final_lab;
-          finally end_lab code;
+          finally code;
         end
-      | _ ->
-        begin
-          print "# end catch";
-          print final_lab;
-        end
-      end
+      | _ -> print final_lab;
+      end;
+      (* if the exception has been caught, jump to the end *)
+      cmp (Const(0)) ecx;
+      je (Global(end_lab));
+      (* if not, throw the exception again *)
+      throw_again ();
+      print "# end catch";
+      print end_lab;
     end
   end
     
@@ -737,7 +742,7 @@ let compile out decl_list =
             end
           in
           let env = find_args 0 [] var_list in
-          compile_code out func env c;
+          compile_code out func env [] c;
           print "# subroutine epilogue";
           print (func ^ "_epilogue");
           leave ();
@@ -752,7 +757,7 @@ let compile out decl_list =
     (** analagous to the following C code : **)
     (** fprintf(stderr, "error : uncaught exception '%s %d'", exc, value); **)
     (** fflush(stderr); abort(); **)
-    let err_msg = "error : uncaught exception '%s %d'\n" in
+    let err_msg = "Error : uncaught exception '%s %d'. Aborting...\n" in
     print error_label;
     compile_expr out "err" [] (("",0,0,0,0), STRING(err_msg));
     push ebx;
