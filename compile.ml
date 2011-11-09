@@ -367,68 +367,97 @@ let rec compile_expr out func env e =
 
 let rec compile_code out func env finally_list code =
 (* type :: out_channel -> string -> (string * int) list ->   Cparse.var_declaration list -> unit *)
-  let add = add_ out and sub = sub_ out and cmp = cmp_ out and jmp = jmp_ out         and je = je_ out and jne = jne_ out and push = push_ out and pop = pop_ out and mov = mov_ out and call = call_ out and print = Printf.fprintf out "%s:\n"  and lea = lea_ out in
-  let handler_name = "_eh" and error_label = "_uncaught_exc" in
-  
-  let jmp_at addr =
+  let add = add_ out and sub = sub_ out and cmp = cmp_ out and jmp = jmp_ out         and je = je_ out and jne = jne_ out and push = push_ out and pop = pop_ out and mov = mov_ out and call = call_ out and print = Printf.fprintf out "%s:\n"  and lea = lea_ out 
+  and jmp_at addr =
     let s = str_of_obj addr in
     Printf.fprintf out "    jmp     *%s\n" s
   in
-
+  
+  (*************** EXCEPTION HANDLING FUNCTIONS ***************)
+  
+  (* A global variable named <handler_name> is declared *)
+  (* at the beginning of the file. *) 
+  (* I call it the exception handler. It is used to... handle exceptions. *)
+  (* It is a stack of registrations: *)
+  (* Each registration records the scope of a given try, *)
+  (* it contains all the informations needed *)
+  (* to jump to the current try's catch handlers (label = program counter) *)
+  (* and to return to the proper memory state (stack registers esp, ebp) *)
+  let handler_name = "_eh" and error_label = "_uncaught_exc" in
+  
+  (** Stack functions - linked list implementation **)
   let create_registration first_catch_label =
     begin
+      (* Allocate heap memory for the registration *)
       push (Const(16));
       call (Global("malloc"));
       add (Const(4)) esp;
+      (* Put the proper informations in it (esp, ebp, eip to go to) *)
       mov ebp (Indirect(0, EAX));
       mov esp (Indirect(4, EAX));
       lea (Global(first_catch_label)) edx;
       mov edx (Indirect(8, EAX));
     end
-  in
-
-  let free_registration () =
+  and free_registration () =
     begin
       push eax;
       call (Global("free"));
       add (Const(4)) esp;
     end
-  in
-
-  let push_registration () =
+  and push_registration () =
+    (* We assume the registration has been created and put in eax *)
     begin
+     (* Link the registration to the previous head of the linked list *)
+     (* and put this new head as the current exception handler *)
      mov (Global(handler_name)) edx;
      mov edx (Indirect(12, EAX));
      mov eax (Global(handler_name));
     end
-  in
-
-  let pop_registration () =
+  and pop_registration () =
     begin
+     (* Pop the top registration of the exception handler in eax *)
+     (* which is just the head of the linked list *)
      mov (Global(handler_name)) eax;
      (* If the exception handler stack is empty, quit program with an error *)
      cmp (Const(0)) eax;
      je (Global(error_label));
-     (* If the stack is not empty, put the next element as top of the stack *)
+     (* If the stack is not empty, put the next link as top of the stack *)
      mov (Indirect(12, EAX)) edx;
      mov edx (Global(handler_name));
     end
   in
   
+  (** Functions to manage of the exception handler **)
+  let begin_try first_catch_label =
+    (* At the beginning of each try block, we push a registration *)
+    begin
+      create_registration first_catch_label;
+      push_registration ();
+    end
+  and end_try final_label =
+    (* the registrations pushed have the scope of the try block *)
+    (* which means they have to be removed upon exit of the try block *)
+    begin
+      pop_registration ();
+      free_registration ();
+      mov (Const(0)) ecx;
+      jmp (Global(final_label));
+    end
+  in
   let throw_again () =
     (* We assume that the name of the exception has been put in ecx *)
-    (* and the value of the exception in ebx *)
+    (* and the value of the exception in ebx. *)
     begin
-      (* Pop the exception handler *)
+      (* Pop the registration of the current try block *)
       pop_registration ();
-      (* If an exception handler was found... *)
-      (** restore the frame context of the try block **)
+      (* If a registration was found... *)
+      (** restore the stack frame context of the try block **)
       mov (Indirect(0, EAX)) ebp;
       mov (Indirect(4, EAX)) esp;
       push ebx;
       push ecx;
       push (Indirect(8, EAX));
-      (** free the handler from memory **)
+      (** free the registration from memory **)
       free_registration ();
       (** and jump to the first catch **)
       pop edx;
@@ -437,10 +466,10 @@ let rec compile_code out func env finally_list code =
       jmp_at edx;
     end
   in
-
   let throw exc_name exp locator =
-    (* exc_name: Name of the exception thrown *)
-    (* exp: Value of the exception *)
+    (* This is a complete compilation of a throw instruction *)
+    (* exc_name: name of the exception thrown *)
+    (* exp: value of the exception *)
     begin
       (* Initialize the exception registers ecx and ebx *)
       (** put the value of the exception in ebx **)
@@ -449,28 +478,12 @@ let rec compile_code out func env finally_list code =
       (** put the name of the exception in ecx **)
       compile_expr out func env (locator, STRING(exc_name));
       mov eax ecx;
-      (* Throw from ecx and ebx*)
+      (* throw from ecx and ebx *)
       throw_again ();
     end
-  in
-
-  let begin_try first_catch_label =
-    begin
-      create_registration first_catch_label;
-      push_registration ();
-    end
-  in
-
-  let end_try final_label =
-    begin
-      pop_registration ();
-      free_registration ();
-      mov (Const(0)) ecx;
-      jmp (Global(final_label));
-    end
-  in
-
-  let catch catch_label next_label final_label exc_name var_name code loc =
+  and catch catch_label next_label final_label exc_name var_name code loc =
+    (* This is used to compile one catch clause in a given try-catch,  *)
+    (* linking it to the other catches or finally. *)
     (* next_label: address of the next catch (= finally_label if no more) *)
     (* finally_label: address of the finally (= end_label if no finally) *)
     (* exc_name: name of the exception to be caught *)
@@ -486,7 +499,7 @@ let rec compile_code out func env finally_list code =
       add (Const(4)) esp;
       pop ecx;
       pop ebx;
-      (* if the names don't match, jump to the next catch *)
+      (* if the names don't match, jump to the next catch or finally *)
       cmp (Const(0)) eax;
       jne (Global(next_label));
       (* if they do... *)
@@ -501,27 +514,40 @@ let rec compile_code out func env finally_list code =
       mov ebx (Local(List.assoc var_name new_env));
       (** compile the code of the catch **)
       compile_code out func new_env finally_list code;
+      print ("# end catch " ^ exc_name);
       (** free the variable **)
       add (Const(4)) esp;
-      (** delete the exception **)
+      (** delete the exception by putting 0 in ecx **)
       mov (Const(0)) ecx;
       (** jump to the finally or end label **)
       jmp (Global(final_label));
     end
-  in
-
-  let finally code =
+  and finally_compilecode code =
+    (* This is an uncomplete compilation of the finally clause. *)
+    (* It is used to compile the code of the finally *)
+    (* without deterioring the informations contained in ebx and ecx *)
+    (* related to the current exception being thrown *)
     begin
-      (* compile the code of the finally *)
-      (* being careful to save then restore the exception registers *)
+      let rec find_min_offset = function
+      | [] -> 0
+      | (_, offset) :: t -> min offset (find_min_offset t)
+      in
+      let min_offset = find_min_offset env in
+      let new_env = ("$", min_offset - 8) :: env in
+      (* save the exception registers on the stack *)
       push ebx;
       push ecx;
-      compile_code out func env finally_list code;
+      (* then compile the code of the finally *)
+      (* being careful to take into account the offset in esp value *)
+      (* by adding a sample variable to the environment *)
+      compile_code out func new_env finally_list code;
+      (* restore the exception registers *)
       pop ecx;
       pop ebx;
     end
   in
-    
+  
+  (*************** INSTRUCTION COMPILATION ***************)  
   begin match (snd code) with
   | CBLOCK (vars, blockcode) ->
     (* { vars: variable declarations; blockcode: sequence of instructions } *)
@@ -560,7 +586,7 @@ let rec compile_code out func env finally_list code =
       print "# no";
       compile_code out func env finally_list c2;
       jmp (Global(end_label));
-      print "# yes";
+      print "# yes"; 
       print yes_label;
       compile_code out func env finally_list c1;
       print "# exit if";
@@ -583,33 +609,52 @@ let rec compile_code out func env finally_list code =
     end
   | CRETURN op ->
     (* return exp; *)
+    (* A return statement behaves like a throw statement. *)
+    (* The exception thrown by the return is automatically caught *)
+    (* at the end of the function, and has the value of "exp". *)
+    (* The exception thrown by the return will not be caught *)
+    (* until the end of the function, so we have to pass through *)
+    (* all the finally clauses that have a scope wider or equal to *)
+    (* the current try block. *)
+    (* To do this, we memorize at compile-time the finally clauses *)
+    (* of all the try blocks we pass through in the list "finally_list". *)
     begin
-      (* execute finally clauses of the try blocks inside the *)
-      (* current function *)
+      let nline = match (fst code) with
+      | (_, l, _, _, _) -> l in
+      let return_name = Printf.sprintf "return line %d" nline in
+      print ("# " ^ return_name);
       let rec finish = function
       | [] -> ()
       | h :: t -> 
         begin
+          (* pop and free the registration of each try block *)
           pop_registration ();
           free_registration ();
-          match h with
-          | Some (code) -> compile_code out func env t code;
+          begin match h with
+          | Some (code) ->
+            begin
+              (* compile the code of each finally *)
+              print ("# finally from " ^ return_name);
+              compile_code out func env t code;
+            end
           | _ -> ();
+          end;
           finish t;
         end
       in
       finish finally_list;
-      (* then actually return from the function *)
+      (* then actually return from the function. *)
       begin match op with
       | Some exp -> compile_expr out func env exp
       | _ -> ()
       end;
+      (** epilogue: label where the function epilogue is put **)
       let epilogue = func ^ "_epilogue" in
-      (* if there is no finally *)
-      jmp (Global(epilogue)); (* label where the function epilogue is put *)
+      print ("# end " ^ return_name);
+      jmp (Global(epilogue));
     end
   | CTHROW (exc_name, exp) ->
-    (* throw exc_name (exp)*)
+    (* throw exc_name (exp) *)
     begin
       throw exc_name exp (fst code);
     end
@@ -617,7 +662,7 @@ let rec compile_code out func env finally_list code =
     (* try c; catch (Exc1 x1) c1;... catch (Excn xn) cn; finally cf;
     where l = [("Exc1", "x1", c1);...] *)
     begin
-      (* initialise list of labels of each catch and finally clause *)
+      (* initialize list of labels of each catch and finally clause *)
       let rec make_lcatch = function
       | [] -> []
       | h :: t -> (genlab func, h)  :: (make_lcatch t)
@@ -636,12 +681,12 @@ let rec compile_code out func env finally_list code =
       print "# end try block";
       end_try final_lab;
       
-      (* catch exceptions *)
+      (* compile each catch *)
       print "# catch exception handling";
       let rec compile_catch final_lab = function
       | [] -> ()
       | [(catch_lab, (exc, var, code))] ->
-          catch catch_lab final_lab final_lab exc var code (fst code)
+          catch catch_lab final_lab final_lab exc var code (fst code);
       | (catch_lab, (exc, var, code)) :: (((next_lab, _) :: _) as t) ->
         begin
           catch catch_lab next_lab final_lab exc var code (fst code);
@@ -657,14 +702,16 @@ let rec compile_code out func env finally_list code =
         begin
           print "# finally";
           print final_lab;
-          finally code;
+          (** compile its code **)
+          finally_compilecode code;
         end
       | _ -> print final_lab;
       end;
-      (* if the exception has been caught, jump to the end *)
+      (** if there is no exception left (exception caught or not thrown) **)
+      (** exception has been caught, just jump to the end **)
       cmp (Const(0)) ecx;
       je (Global(end_lab));
-      (* if not, throw the exception again *)
+      (** if not, we have to throw the exception again **)
       throw_again ();
       print "# end catch";
       print end_lab;
