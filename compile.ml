@@ -373,7 +373,7 @@ let rec compile_code out func env finally_list code =
     Printf.fprintf out "    jmp     *%s\n" s
   in
   
-  (*************** EXCEPTION HANDLING FUNCTIONS ***************)
+  (*************** FUNCTIONS TO HELP EXCEPTION HANDLING ***************)
   
   (* A global variable named <handler_name> is declared *)
   (* at the beginning of the file. *) 
@@ -547,7 +547,7 @@ let rec compile_code out func env finally_list code =
     end
   in
   
-  (*************** INSTRUCTION COMPILATION ***************)  
+  (*************** COMPILATION OF THE INSTRUCTION ***************)  
   begin match (snd code) with
   | CBLOCK (vars, blockcode) ->
     (* { vars: variable declarations; blockcode: sequence of instructions } *)
@@ -622,20 +622,40 @@ let rec compile_code out func env finally_list code =
       let nline = match (fst code) with
       | (_, l, _, _, _) -> l in
       let return_name = Printf.sprintf "return line %d" nline in
-      print ("# " ^ return_name);
+      print ("# " ^ return_name); 
+      (* compute the return value *)
+      begin match op with
+      | Some exp -> 
+        begin
+          compile_expr out func env exp;
+          
+        end
+      | _ -> ()
+      end;
+      (* save it on the stack *)
+      push eax;
+      (* take into account the offset of esp by adding a new variable
+      to the environment *)
+      let rec find_min_offset = function
+      | [] -> 0
+      | (_, offset) :: t -> min offset (find_min_offset t)
+      in
+      let min_offset = find_min_offset env in
+      let new_env = ("$", min_offset - 4) :: env in
+      (* pass through the finally clauses *)
       let rec finish = function
       | [] -> ()
       | h :: t -> 
         begin
-          (* pop and free the registration of each try block *)
+          (** pop and free the registration of each try block **)
           pop_registration ();
           free_registration ();
           begin match h with
           | Some (code) ->
             begin
-              (* compile the code of each finally *)
+              (** compile the code of each finally **)
               print ("# finally from " ^ return_name);
-              compile_code out func env t code;
+              compile_code out func new_env t code;
             end
           | _ -> ();
           end;
@@ -643,11 +663,9 @@ let rec compile_code out func env finally_list code =
         end
       in
       finish finally_list;
+      (* restore the return value *)
+      pop eax;
       (* then actually return from the function. *)
-      begin match op with
-      | Some exp -> compile_expr out func env exp
-      | _ -> ()
-      end;
       (** epilogue: label where the function epilogue is put **)
       let epilogue = func ^ "_epilogue" in
       print ("# end " ^ return_name);
@@ -751,7 +769,7 @@ let compile out decl_list =
     in
     let var_list = get_var decl_list and fun_list = get_fun decl_list in
     
-    (* compile global variable declarations *)
+    (* Compile global variable declarations *)
     if var_list = [] then () else begin
       printn "# global variables data segment";
       let compile_var = function
@@ -765,7 +783,7 @@ let compile out decl_list =
       printn "";
     end;
     
-    (* compile functions *)
+    (* Compile functions *)
     if fun_list = [] then () else begin
       printn ".text";
       let compile_fun = function
@@ -800,11 +818,11 @@ let compile out decl_list =
       List.iter compile_fun fun_list;
     end;
     
-    (* create code to handle uncaught exception errors *)
+    (* Create code to handle uncaught exception errors *)
     (** analagous to the following C code : **)
     (** fprintf(stderr, "error : uncaught exception '%s %d'", exc, value); **)
     (** fflush(stderr); abort(); **)
-    let err_msg = "Error : uncaught exception '%s %d'. Aborting...\n" in
+    let err_msg = "Uncaught exception '%s %d'. Aborting...\n" in
     print error_label;
     compile_expr out "err" [] (("",0,0,0,0), STRING(err_msg));
     push ebx;
@@ -816,7 +834,7 @@ let compile out decl_list =
     add (Const(12)) esp;
     call (Global("abort"));
     
-    (* compile string declarations *)
+    (* Compile string declarations *)
     if (!str_decl <> []) then print "\n# strings storage segment";
     let compile_str (str, label) = 
       begin
